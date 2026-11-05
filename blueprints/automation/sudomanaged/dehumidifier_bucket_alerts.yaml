@@ -1,0 +1,150 @@
+blueprint:
+  name: Dehumidifier bucket alerts
+  description: >-
+    Tells you when a dehumidifier's bucket is almost full and when it is full, using the sensor from the
+    "Dehumidifier bucket tracker" blueprint.
+
+
+    With the Home Assistant app options on, both alerts use the same notification tag, so "full" replaces "almost
+    full" on your phone instead of piling up, and the phone notification is cleared when the bucket is emptied.
+    The Home Assistant notification (the bell) is dismissed when the bucket is emptied too.
+  domain: automation
+  source_url: https://github.com/SudoManaged/ha-dehumidifier-kit/blob/main/blueprints/automation/sudomanaged/dehumidifier_bucket_alerts.yaml
+  author: SudoManaged
+  homeassistant:
+    min_version: 2025.8.0
+  input:
+    bucket_sensor:
+      name: Bucket sensor
+      description: The bucket level sensor made by the "Dehumidifier bucket tracker" blueprint.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+    almost_percent:
+      name: Almost full at (%)
+      description: The level for the "almost full" alert. Set 100 to get only the "full" alert.
+      default: 85
+      selector:
+        number:
+          min: 50
+          max: 100
+          unit_of_measurement: "%"
+    notify_action:
+      name: Notify action
+      description: >-
+        Where alerts go: a notify action such as `notify.mobile_app_my_phone` (one phone with the Home Assistant
+        app), `notify.notify` (with the app installed: every phone with the app) or a notify group defined in
+        YAML. Notify entities (`notify.send_message`) are not supported.
+      default: notify.notify
+      selector:
+        text:
+    phone_app:
+      name: Home Assistant app options
+      description: >-
+        Send the phone app's options: one tag per dehumidifier ("full" replaces "almost full"), high priority so
+        Android delivers it at once, and clear the phone notification when the bucket is emptied. Turn this off if
+        your notify action is not the Home Assistant app (it would receive "clear_notification" as a message).
+      default: true
+      selector:
+        boolean:
+    persistent:
+      name: Also show alerts inside Home Assistant
+      description: Create a Home Assistant notification (the bell), dismissed when the bucket is emptied.
+      default: true
+      selector:
+        boolean:
+mode: queued
+max: 10
+trigger_variables:
+  bucket: !input bucket_sensor
+triggers:
+  - trigger: numeric_state
+    entity_id: !input bucket_sensor
+    above: !input almost_percent
+    id: almost
+  - trigger: template
+    value_template: "{{ state_attr(bucket, 'full') in [true, 'true', 'True'] }}"
+    id: full
+  # Emptied: not full any more, and the level is back near 0 (or unknown, before the bucket size is learned).
+  - trigger: template
+    value_template: >-
+      {{ state_attr(bucket, 'full') in [false, 'false', 'False'] and states(bucket) | float(0) < 5 }}
+    id: emptied
+variables:
+  almost_percent: !input almost_percent
+  notify_action: !input notify_action
+  phone_app: !input phone_app
+  persistent: !input persistent
+  is_full: "{{ state_attr(bucket, 'full') in [true, 'true', 'True'] }}"
+  room: "{{ state_attr(bucket, 'friendly_name') or bucket }}"
+  level: "{{ states(bucket) | float(0) | round(0) | int }}"
+  used: "{{ state_attr(bucket, 'energy_kwh') | float(0) | round(1) }}"
+  capacity: "{{ state_attr(bucket, 'capacity_kwh') | float(0) | round(1) }}"
+  tag: "dehumidifier-bucket-{{ bucket | slugify }}"
+  title: >-
+    {{ room }}: {{ 'full' if trigger.id == 'full' else 'about ' ~ level ~ '% full' }}
+  message: >-
+    {%- if trigger.id == 'full' -%}
+      The dehumidifier stopped with its plug on: the bucket is full (or the unit was switched off at its own
+      button). Empty it to start it again.
+    {%- else -%}
+      It has used {{ used }} of about {{ capacity }} kWh per bucket since it was last emptied. Empty it soon.
+    {%- endif %}
+conditions:
+  # "Almost full" is skipped when the bucket is already full: the full alert covers it.
+  - condition: template
+    value_template: "{{ trigger.id != 'almost' or (not is_full and almost_percent | float < 100) }}"
+  # A sensor coming back from unavailable (a reload of template entities) is not a new alert.
+  - condition: template
+    value_template: >-
+      {{ trigger.id == 'emptied' or trigger.from_state is none or trigger.from_state.state != 'unavailable' }}
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ trigger.id == 'emptied' }}"
+    then:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: "{{ tag }}"
+      - if:
+          - condition: template
+            value_template: "{{ phone_app }}"
+        then:
+          - action: "{{ notify_action }}"
+            data:
+              message: clear_notification
+              data:
+                tag: "{{ tag }}"
+    else:
+      - action: logbook.log
+        data:
+          name: "{{ room }}"
+          message: "{{ title }}"
+          entity_id: "{{ bucket }}"
+      - if:
+          - condition: template
+            value_template: "{{ persistent }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"
+              notification_id: "{{ tag }}"
+      - if:
+          - condition: template
+            value_template: "{{ phone_app }}"
+        then:
+          - action: "{{ notify_action }}"
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"
+              data:
+                tag: "{{ tag }}"
+                ttl: 0
+                priority: high
+        else:
+          - action: "{{ notify_action }}"
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"

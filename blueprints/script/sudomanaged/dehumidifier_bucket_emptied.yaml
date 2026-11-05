@@ -1,0 +1,27 @@
+blueprint:
+  name: Dehumidifier bucket emptied
+  description: >-
+    Tells a "Dehumidifier bucket tracker" sensor that you emptied its bucket, so its count starts again at 0.
+    Use it when you empty the bucket before it is full; a full bucket is noticed by itself when the unit starts
+    again.
+
+
+    A bucket emptied with this script is never used to learn the bucket size, so a partly full bucket cannot skew
+    it. Make one script per dehumidifier and put it on a dashboard (the README shows a tile with a confirmation).
+  domain: script
+  source_url: https://github.com/SudoManaged/ha-dehumidifier-kit/blob/main/blueprints/script/sudomanaged/dehumidifier_bucket_emptied.yaml
+  author: SudoManaged
+  homeassistant:
+    min_version: 2025.8.0
+  input:
+    bucket_name:
+      name: Bucket name
+      description: The same "Bucket name" you gave the "Dehumidifier bucket tracker", for example "bedroom".
+      selector:
+        text:
+mode: single
+icon: mdi:water-off
+sequence:
+  - event: dehumidifier_bucket_emptied
+    event_data:
+      bucket: !input bucket_name

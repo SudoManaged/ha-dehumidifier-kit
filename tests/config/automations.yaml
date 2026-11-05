@@ -1,0 +1,14 @@
+- id: test_dehumidifier_humidity_band
+  alias: Test dehumidifier humidity band
+  use_blueprint:
+    path: sudomanaged/dehumidifier_humidity_band.yaml
+    input:
+      humidity_sensor: sensor.test_humidity
+      plug_switch: switch.test_dehumidifier_plug
+- id: test_dehumidifier_bucket_alerts
+  alias: Test dehumidifier bucket alerts
+  use_blueprint:
+    path: sudomanaged/dehumidifier_bucket_alerts.yaml
+    input:
+      bucket_sensor: sensor.test_dehumidifier_bucket
+      notify_action: notify.persistent_notification

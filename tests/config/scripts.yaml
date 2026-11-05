@@ -1,0 +1,6 @@
+test_bucket_emptied:
+  alias: Test bucket emptied
+  use_blueprint:
+    path: sudomanaged/dehumidifier_bucket_emptied.yaml
+    input:
+      bucket_name: test

@@ -1,0 +1,138 @@
+blueprint:
+  name: Dehumidifier humidity band
+  description: >-
+    Runs a dehumidifier from a humidity sensor through its smart plug: on when the humidity climbs above the top
+    of your band, off when it falls below the bottom.
+
+
+    The gap between the two numbers stops the unit from flicking on and off around one number. A minimum off
+    time gives the compressor a rest before it starts again. Every 5 minutes (and when Home Assistant starts) the
+    automation checks again, so a missed change or a restart never leaves the unit in the wrong state.
+
+
+    Set the dehumidifier itself to run continuously (its own target at its lowest setting, or "continuous" mode)
+    so the plug is in charge. To pause it, turn this automation off.
+  domain: automation
+  source_url: https://github.com/SudoManaged/ha-dehumidifier-kit/blob/main/blueprints/automation/sudomanaged/dehumidifier_humidity_band.yaml
+  author: SudoManaged
+  homeassistant:
+    min_version: 2025.8.0
+  input:
+    humidity_sensor:
+      name: Humidity sensor
+      description: The room's humidity sensor (%). One away from the dehumidifier's own air outlet reads truer.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: humidity
+    plug_switch:
+      name: Smart plug
+      description: The switch of the smart plug the dehumidifier is plugged into.
+      selector:
+        entity:
+          filter:
+            - domain: switch
+    on_above:
+      name: Turn on above (%)
+      default: 55
+      selector:
+        number:
+          min: 20
+          max: 90
+          unit_of_measurement: "%"
+    off_below:
+      name: Turn off below (%)
+      description: Must be lower than "Turn on above". A gap of 5 or more works well.
+      default: 48
+      selector:
+        number:
+          min: 15
+          max: 85
+          unit_of_measurement: "%"
+    hold_minutes:
+      name: Humidity must stay there for (minutes)
+      description: Rides over short bumps, such as a shower or an open door.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 30
+          unit_of_measurement: min
+    min_off_minutes:
+      name: Minimum off time (minutes)
+      description: >-
+        How long the plug must have been off before it is switched on again. Compressors need a few minutes for
+        the pressure to settle; 5 is a safe value.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: min
+mode: single
+max_exceeded: silent
+triggers:
+  - trigger: numeric_state
+    entity_id: !input humidity_sensor
+    above: !input on_above
+    for:
+      minutes: !input hold_minutes
+    id: high
+  - trigger: numeric_state
+    entity_id: !input humidity_sensor
+    below: !input off_below
+    for:
+      minutes: !input hold_minutes
+    id: low
+  - trigger: time_pattern
+    minutes: /5
+    id: check
+  - trigger: homeassistant
+    event: start
+    id: check
+variables:
+  humidity_sensor: !input humidity_sensor
+  plug: !input plug_switch
+  on_above: !input on_above
+  off_below: !input off_below
+  hold_minutes: !input hold_minutes
+  min_off_minutes: !input min_off_minutes
+  humidity: "{{ states(humidity_sensor) | float(none) }}"
+conditions:
+  - condition: template
+    value_template: "{{ humidity is not none and off_below | float < on_above | float }}"
+# The humidity triggers already waited "hold" minutes. The 5-minute check and the start check wait the same time
+# here, and give up if the humidity goes back inside the band meanwhile.
+actions:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ humidity > on_above | float and is_state(plug, 'off')
+                 and (now() - states[plug].last_changed).total_seconds() >= min_off_minutes | float * 60 }}
+        sequence:
+          - wait_template: >-
+              {{ trigger.id != 'check' or states(humidity_sensor) | float(0) <= on_above | float }}
+            timeout:
+              minutes: "{{ hold_minutes }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ trigger.id != 'check' or not wait.completed }}"
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ plug }}"
+      - conditions:
+          - condition: template
+            value_template: "{{ humidity < off_below | float and is_state(plug, 'on') }}"
+        sequence:
+          - wait_template: >-
+              {{ trigger.id != 'check' or states(humidity_sensor) | float(100) >= off_below | float }}
+            timeout:
+              minutes: "{{ hold_minutes }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ trigger.id != 'check' or not wait.completed }}"
+          - action: switch.turn_off
+            target:
+              entity_id: "{{ plug }}"

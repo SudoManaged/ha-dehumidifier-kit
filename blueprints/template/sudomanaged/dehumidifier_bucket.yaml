@@ -1,0 +1,582 @@
+blueprint:
+  name: Dehumidifier bucket tracker
+  description: >-
+    Knows how full your dehumidifier's water bucket is, using only the smart plug it is plugged into.
+
+
+    The water a dehumidifier collects follows the energy its compressor uses. The tracker counts the energy used
+    since the bucket was last emptied and compares it with the energy a full bucket took before, which gives the
+    bucket level in percent. It learns your bucket's size by itself: when the unit stops because the bucket is
+    full (the plug is on but the power drops to almost nothing), it shows 100%. When the compressor starts again
+    after that, the bucket was emptied: that bucket's energy is learned (if its count started when the bucket was
+    emptied) and the count starts over. The "Dehumidifier bucket emptied" script resets the count when you empty
+    the bucket early, without learning from it (it also takes back a bucket learned in the last 10 minutes); run
+    it once when you set the tracker up, right after emptying the bucket.
+
+
+    State: the bucket level in % (100 while the bucket is full; otherwise unknown until the first learned bucket,
+    unless you enter a known size). Attributes: full, energy_kwh, capacity_kwh, buckets, pending_kwh, learned_at,
+    emptied_at, last_counter, last_counter_at, low_since, bucket_name.
+  domain: template
+  source_url: https://github.com/SudoManaged/ha-dehumidifier-kit/blob/main/blueprints/template/sudomanaged/dehumidifier_bucket.yaml
+  author: SudoManaged
+  homeassistant:
+    min_version: 2025.8.0
+  input:
+    plug_switch:
+      name: Smart plug
+      description: The switch of the smart plug the dehumidifier is plugged into.
+      selector:
+        entity:
+          filter:
+            - domain: switch
+    power_sensor:
+      name: Plug power sensor (W)
+      description: The plug's current power in watts.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: power
+    energy_sensor:
+      name: Plug energy sensor (kWh)
+      description: >-
+        An energy counter of the plug, in kWh or Wh. A lifetime counter and a counter that starts again every day
+        ("today's energy") both work: the tracker notices when the counter starts again.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: energy
+    bucket_name:
+      name: Bucket name
+      description: >-
+        A short name for this dehumidifier, for example "bedroom". The "Dehumidifier bucket emptied" script uses
+        the same name to reset this tracker. Use lowercase letters, digits and underscores.
+      selector:
+        text:
+    full_watts:
+      name: Stopped below (W)
+      description: >-
+        Power below this while the plug is on means the unit has stopped. Most units draw a few watts or less
+        when they stop for a full bucket.
+      default: 5
+      selector:
+        number:
+          min: 0.5
+          max: 50
+          step: 0.5
+          unit_of_measurement: W
+    full_minutes:
+      name: Stopped for (minutes)
+      description: How long the unit must stay stopped before the bucket counts as full.
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: min
+    running_watts:
+      name: Compressor running above (W)
+      description: >-
+        Power above this means the compressor is running. Pick a value between the fan-only power and the
+        compressor power (look at the plug's power history while the unit runs). The compressor starting again
+        after a full stop means the bucket was emptied.
+      default: 150
+      selector:
+        number:
+          min: 20
+          max: 2000
+          unit_of_measurement: W
+    min_bucket_kwh:
+      name: Smallest real bucket (kWh)
+      description: >-
+        A stop with less energy than this since the last empty still shows as full, but is not used to learn the
+        bucket size (for example the unit was switched off at its own button soon after an empty). About a third
+        of a normal bucket works well.
+      default: 1
+      selector:
+        number:
+          min: 0.1
+          max: 50
+          step: 0.1
+          unit_of_measurement: kWh
+    initial_capacity_kwh:
+      name: Known bucket size (kWh, optional)
+      description: >-
+        If you already know how much energy a full bucket takes, enter it to get a level right away. Leave 0 to
+        learn it from the first full bucket. Learned buckets replace it.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.01
+          unit_of_measurement: kWh
+    learn_buckets:
+      name: Buckets to average
+      description: The bucket size is the average of this many most recent full buckets.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+# Every minute the tracker looks at the plug (so a bucket that filled or was emptied while Home Assistant was down
+# is noticed too), and each energy reading adds to the count. The settings ride on each trigger as trigger
+# variables, which every supported release passes to the sensor's templates; 2025.8 is the first release where a
+# trigger-based sensor can be unknown (before the first learned bucket).
+triggers:
+  - trigger: state
+    entity_id: !input energy_sensor
+    id: energy
+    variables: &settings
+      plug: !input plug_switch
+      power: !input power_sensor
+      bucket: !input bucket_name
+      full_w: !input full_watts
+      full_min: !input full_minutes
+      run_w: !input running_watts
+      min_kwh: !input min_bucket_kwh
+      initial_kwh: !input initial_capacity_kwh
+      learn: !input learn_buckets
+      # What this moment means, worked out once for all the templates below.
+      plug_on: "{{ is_state(plug, 'on') }}"
+      plug_known: "{{ states(plug) in ['on', 'off'] }}"
+      power_known: "{{ states(power) | is_number }}"
+      power_w: "{{ states(power) | float(0) }}"
+      reading: >-
+        {%- if trigger.id == 'energy' and trigger.to_state is not none and trigger.to_state.state | is_number %}
+          {{- trigger.to_state.state | float / (1000 if trigger.to_state.attributes.get('unit_of_measurement') == 'Wh' else 1) }}
+        {%- else %}{{ none }}{% endif %}
+      emptied_event: "{{ trigger.id == 'emptied' and trigger.event.data.get('bucket') == bucket }}"
+      forget: >-
+        {{ trigger.id == 'emptied' and trigger.event.data.get('bucket') == bucket
+           and trigger.event.data.get('forget_learned', false) in [true, 'true', 'True'] }}
+  - trigger: time_pattern
+    minutes: /1
+    id: check
+    variables: *settings
+  - trigger: event
+    event_type: dehumidifier_bucket_emptied
+    id: emptied
+    variables: *settings
+sensor:
+  unit_of_measurement: "%"
+  state_class: measurement
+  icon: mdi:cup-water
+  # Home Assistant renders each template on its own, so every template repeats the same opening block (the
+  # bucket's logic) from the previous values in this.attributes and ends with its own value:
+  # - full: the plug is on and the power has stayed below "Stopped below" for "Stopped for" minutes (with half a
+  #   minute of margin, since the check itself runs once a minute). A moment with the plug or power unavailable
+  #   keeps the timer as it is.
+  # - emptied: the "emptied" event, or the compressor running again after a full stop.
+  # - energy: each new reading adds its difference; a drop of less than 10% is ignored, a bigger drop means the
+  #   counter started again; an increase faster than 4 kW since the last reading is a glitch and is not counted.
+  #   The count is kept to 6 decimals (written out in full, so Home Assistant keeps it a number), so small
+  #   readings from fine-grained counters add up.
+  # - learning: when a bucket becomes full, its energy waits in pending_kwh (if its count started at a known empty
+  #   and it is at least "Smallest real bucket"). It is learned when the compressor runs again. An "emptied" event
+  #   discards it, or takes back a bucket learned in the last 10 minutes, so a bucket taken out early is not
+  #   learned whether the script is run before or after the unit starts again.
+  # Readings are turned into numbers first, because Home Assistant leaves some (such as 5e-05) as text.
+  state: >-
+    {%- set a = this.attributes %}
+    {%- set power_w = power_w | float(0) %}
+    {%- set reading = reading | float(none) %}
+    {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+    {%- set unsure = not power_known or not plug_known %}
+    {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+    {%- set low = plug_on and not unsure and power_w < full_w | float %}
+    {%- set low_prev = a.get('low_since') %}
+    {%- set stopped = low and not reset and low_prev is not none
+          and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+    {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+    {%- set full = (was_full or stopped) and not reset %}
+    {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+    {%- set last = a.get('last_counter') | float(none) %}
+    {%- set ns = namespace(inc=0) %}
+    {%- if reading is not none and last is not none %}
+      {%- if reading >= last %}{% set ns.inc = reading - last %}
+      {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+      {%- set at = a.get('last_counter_at') %}
+      {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+    {%- endif %}
+    {%- set acc = 0 if reset else acc0 + ns.inc %}
+    {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+    {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+    {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+      {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+    {%- elif emptied_event and not was_full and nb.at and nb.b
+          and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+      {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+    {%- endif %}
+    {%- set b = nb.b %}
+    {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+          and a.get('emptied_at') else pending_prev) %}
+    {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+    {%- if full %}100{% elif cap > 0 %}{{ [(acc / cap * 100) | round(0) | int, 100] | min }}{% else %}{{ none }}{% endif %}
+  attributes:
+    full: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ full }}
+    energy_kwh: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ '%.6f' | format(acc) }}
+    capacity_kwh: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ (cap | round(3)) if cap > 0 else none }}
+    buckets: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ b }}
+    pending_kwh: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ pending }}
+    learned_at: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ nb.at }}
+    emptied_at: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ now().isoformat() if reset else a.get('emptied_at') }}
+    last_counter: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {%- if reading is not none and (last is none or reading >= last or reading < last * 0.9) %}{{ '%.6f' | format(reading) }}
+      {%- elif last is not none %}{{ '%.6f' | format(last) }}
+      {%- else %}{{ none }}{% endif %}
+    last_counter_at: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {%- if reading is not none and (last is none or reading >= last or reading < last * 0.9) %}{{ now().isoformat() }}
+      {%- else %}{{ a.get('last_counter_at') }}{% endif %}
+    low_since: >-
+      {%- set a = this.attributes %}
+      {%- set power_w = power_w | float(0) %}
+      {%- set reading = reading | float(none) %}
+      {%- set was_full = a.get('full') in [true, 'true', 'True'] %}
+      {%- set unsure = not power_known or not plug_known %}
+      {%- set reset = emptied_event or (was_full and power_w > run_w | float) %}
+      {%- set low = plug_on and not unsure and power_w < full_w | float %}
+      {%- set low_prev = a.get('low_since') %}
+      {%- set stopped = low and not reset and low_prev is not none
+            and as_timestamp(now()) - as_timestamp(low_prev, as_timestamp(now())) >= full_min | float * 60 - 30 %}
+      {%- set low_since = none if reset else (low_prev if unsure else ((low_prev or now().isoformat()) if low else none)) %}
+      {%- set full = (was_full or stopped) and not reset %}
+      {%- set acc0 = a.get('energy_kwh', 0) | float(0) %}
+      {%- set last = a.get('last_counter') | float(none) %}
+      {%- set ns = namespace(inc=0) %}
+      {%- if reading is not none and last is not none %}
+        {%- if reading >= last %}{% set ns.inc = reading - last %}
+        {%- elif reading < last * 0.9 %}{% set ns.inc = reading %}{% endif %}
+        {%- set at = a.get('last_counter_at') %}
+        {%- if at and ns.inc > 4 * (as_timestamp(now()) - as_timestamp(at, 0)) / 3600 + 0.05 %}{% set ns.inc = 0 %}{% endif %}
+      {%- endif %}
+      {%- set acc = 0 if reset else acc0 + ns.inc %}
+      {%- set pending_prev = a.get('pending_kwh') | float(none) %}
+      {%- set nb = namespace(b=[] if forget else (a.get('buckets') or []), at=none if forget else a.get('learned_at')) %}
+      {%- if was_full and reset and not emptied_event and pending_prev is not none %}
+        {%- set nb.b = (nb.b + [pending_prev | round(3)])[-(learn | int):] %}{% set nb.at = now().isoformat() %}
+      {%- elif emptied_event and not was_full and nb.at and nb.b
+            and as_timestamp(now()) - as_timestamp(nb.at, 0) < 600 %}
+        {%- set nb.b = nb.b[:-1] %}{% set nb.at = none %}
+      {%- endif %}
+      {%- set b = nb.b %}
+      {%- set pending = none if reset else ((acc0 | round(3)) if stopped and not was_full and acc0 >= min_kwh | float
+            and a.get('emptied_at') else pending_prev) %}
+      {%- set cap = (b | sum / b | count) if b else initial_kwh | float %}
+      {{ low_since }}
+    bucket_name: "{{ bucket }}"
