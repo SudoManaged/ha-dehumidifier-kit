@@ -493,6 +493,7 @@ full bucket is learned.
 - [Webhook alerts](https://github.com/SudoManaged/ha-webhook-alerts)
 - [Bluetooth self-heal](https://github.com/SudoManaged/ha-bluetooth-self-heal)
 - [Yealink desk phone call log](https://github.com/SudoManaged/ha-yealink-call-log)
+- [Internet failover alerts](https://github.com/SudoManaged/ha-internet-failover)
 
 ## Changelog and license
 
