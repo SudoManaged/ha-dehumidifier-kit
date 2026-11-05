@@ -494,6 +494,7 @@ full bucket is learned.
 - [Bluetooth self-heal](https://github.com/SudoManaged/ha-bluetooth-self-heal)
 - [Yealink desk phone call log](https://github.com/SudoManaged/ha-yealink-call-log)
 - [Internet failover alerts](https://github.com/SudoManaged/ha-internet-failover)
+- [Daily schedule from several calendars](https://github.com/SudoManaged/ha-daily-schedule)
 
 ## Changelog and license
 
